@@ -2,9 +2,11 @@
 
 import streamlit as st
 import requests
+import requests.exceptions
 import json
 import io
 import base64
+import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import plotly.express as px
@@ -88,17 +90,38 @@ def get_api_data(endpoint: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def post_api_data(endpoint: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def post_api_data(endpoint: str, data: Dict[str, Any], timeout: int = 120) -> Optional[Dict[str, Any]]:
     """Post data to API endpoint."""
     try:
-        response = requests.post(f"{API_BASE_URL}{endpoint}", json=data, timeout=30)
+        # Longer timeout for chat queries (especially LangGraph mode)
+        if "/chat/query" in endpoint:
+            timeout = 120  # 2 minutes for chat queries
+        elif "/documents/upload" in endpoint:
+            timeout = 180  # 3 minutes for document uploads
+        
+        response = requests.post(f"{API_BASE_URL}{endpoint}", json=data, timeout=timeout)
         if response.status_code == 200:
             return response.json()
         else:
             st.error(f"API Error: {response.status_code} - {response.text}")
             return None
+    except requests.exceptions.Timeout:
+        st.error(f"⏱️ Request timed out after {timeout}s. The query may be taking longer than expected.")
+        st.info("💡 **Tips to improve response time:**")
+        st.info("  • Try using `fast` or `ultra_fast` agent mode in `.env`")
+        st.info("  • Simplify your query")
+        st.info("  • Ensure Ollama server is running and responsive")
+        return None
+    except requests.exceptions.ConnectionError:
+        st.error("❌ Cannot connect to API. Please ensure the FastAPI backend is running.")
+        st.info("Run: `python main.py` in your terminal")
+        return None
     except Exception as e:
-        st.error(f"Error posting data: {e}")
+        error_msg = str(e)
+        if "timeout" in error_msg.lower():
+            st.error(f"⏱️ Request timed out. The server may be slow or overloaded.")
+        else:
+            st.error(f"Error posting data: {error_msg}")
         return None
 
 
@@ -132,8 +155,32 @@ def display_chat_message(message: Dict[str, Any], is_user: bool = False):
         
         # Show metadata if available
         if "metadata" in message and message["metadata"]:
-            with st.expander("Message Details"):
-                st.json(message["metadata"])
+            metadata = message["metadata"]
+            with st.expander("📊 Message Details"):
+                # Display key metrics
+                if "query_time" in metadata:
+                    st.metric("⏱️ Response Time", f"{metadata['query_time']:.2f}s")
+                
+                if "agent_mode" in metadata:
+                    mode_badge = "🔷" if metadata["agent_mode"] == "LangGraph" else "⚡"
+                    st.write(f"{mode_badge} **Agent Mode**: {metadata['agent_mode']}")
+                
+                if "iterations" in metadata and metadata["iterations"] is not None:
+                    st.write(f"🔄 **Iterations**: {metadata['iterations']}")
+                    st.write(f"🔧 **Tools Used**: {metadata.get('tools_used', 0)}")
+                
+                if "chunks_retrieved" in metadata:
+                    st.write(f"📄 **Chunks Retrieved**: {metadata['chunks_retrieved']}")
+                
+                if "sources_count" in metadata:
+                    st.write(f"📚 **Sources**: {metadata['sources_count']}")
+                
+                # Show full metadata as JSON
+                if "full_metadata" in metadata:
+                    st.write("**Full Metadata:**")
+                    st.json(metadata["full_metadata"])
+                else:
+                    st.json(metadata)
 
 
 def main():
@@ -164,6 +211,23 @@ def main():
             collection_stats = stats.get("collection_stats", {})
             if collection_stats:
                 st.metric("Total Chunks", collection_stats.get("total_chunks", 0))
+        
+        st.markdown("---")
+        
+        # Agent Mode Information
+        st.markdown("## ⚙️ Agent Configuration")
+        st.info(
+            """
+            **Current Mode**: Determined by `AGENT_MODE` in `.env`
+            
+            **Available Modes**:
+            - `original`: LangGraph with multi-step reasoning
+            - `fast`: Optimized for speed
+            - `ultra_fast`: Maximum speed
+            
+            Edit `.env` and restart backend to change mode.
+            """
+        )
         
         st.markdown("---")
         
@@ -249,18 +313,46 @@ def main():
                     st.session_state.chat_history.append(user_message)
                     
                     # Process query
-                    with st.spinner("🤔 Thinking..."):
+                    status_placeholder = st.empty()
+                    with status_placeholder.container():
+                        st.info("🤔 Processing query... This may take a moment, especially in LangGraph mode.")
+                        
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    # Show progress indicator
+                    try:
                         query_data = {
                             "query": user_input,
                             "session_id": st.session_state.session_id,
                             "max_chunks": 5
                         }
                         
-                        response = post_api_data("/chat/query", query_data)
+                        status_text.text("📡 Connecting to API...")
+                        progress_bar.progress(10)
+                        
+                        status_text.text("🔍 Analyzing query and retrieving context...")
+                        progress_bar.progress(30)
+                        
+                        # Use longer timeout for chat queries
+                        response = post_api_data("/chat/query", query_data, timeout=120)
                         
                         if response:
+                            status_text.text("✅ Generating response...")
+                            progress_bar.progress(90)
+                            
+                            # Small delay to show completion
+                            time.sleep(0.2)
+                            
+                            progress_bar.progress(100)
+                            status_text.text("✅ Complete!")
+                            time.sleep(0.5)
+                            
                             # Update session ID
                             st.session_state.session_id = response["session_id"]
+                            
+                            # Extract metadata for display
+                            metadata = response.get("metadata", {})
                             
                             # Add assistant response to history
                             assistant_message = {
@@ -269,16 +361,33 @@ def main():
                                 "role": "assistant",
                                 "timestamp": datetime.now().isoformat(),
                                 "metadata": {
-                                    "query_time": response["query_time"],
-                                    "sources_count": len(response["sources"]),
-                                    "agent_metadata": response["metadata"]
+                                    "query_time": response.get("query_time", 0),
+                                    "sources_count": len(response.get("sources", [])),
+                                    "iterations": metadata.get("iterations", None),
+                                    "tools_used": metadata.get("tools_used", 0),
+                                    "chunks_retrieved": metadata.get("chunks_retrieved", 0),
+                                    "agent_mode": "LangGraph" if metadata.get("iterations") is not None else "Fast/Ultra-Fast",
+                                    "full_metadata": metadata
                                 }
                             }
                             st.session_state.chat_history.append(assistant_message)
                             
-                            # Clear input
-                            st.session_state.user_input = ""
+                            # Rerun to refresh the page (input will be cleared automatically)
                             st.rerun()
+                        else:
+                            status_text.text("❌ Error occurred")
+                            
+                    except requests.exceptions.Timeout:
+                        status_text.text("⏱️ Request timed out")
+                        st.error("⏱️ The request took too long. Try simplifying your query or switching to fast mode.")
+                    except Exception as e:
+                        status_text.text(f"❌ Error: {str(e)}")
+                        st.error(f"An error occurred: {str(e)}")
+                    finally:
+                        # Clear status indicators
+                        progress_bar.empty()
+                        status_text.empty()
+                        status_placeholder.empty()
         
         with col_input2:
             if st.button("🎤 Voice Input"):
@@ -311,6 +420,9 @@ def main():
             # Extract metrics
             query_times = []
             source_counts = []
+            iterations_list = []
+            tools_used_list = []
+            agent_modes = []
             
             for message in st.session_state.chat_history:
                 if message["role"] == "assistant" and "metadata" in message:
@@ -319,6 +431,12 @@ def main():
                         query_times.append(metadata["query_time"])
                     if "sources_count" in metadata:
                         source_counts.append(metadata["sources_count"])
+                    if "iterations" in metadata and metadata["iterations"] is not None:
+                        iterations_list.append(metadata["iterations"])
+                    if "tools_used" in metadata:
+                        tools_used_list.append(metadata["tools_used"])
+                    if "agent_mode" in metadata:
+                        agent_modes.append(metadata["agent_mode"])
             
             if query_times:
                 # Query time chart
@@ -332,11 +450,42 @@ def main():
                 
                 # Average metrics
                 avg_time = sum(query_times) / len(query_times)
-                st.metric("Avg Response Time", f"{avg_time:.2f}s")
+                st.metric("⏱️ Avg Response Time", f"{avg_time:.2f}s")
             
             if source_counts:
                 avg_sources = sum(source_counts) / len(source_counts)
-                st.metric("Avg Sources Used", f"{avg_sources:.1f}")
+                st.metric("📚 Avg Sources Used", f"{avg_sources:.1f}")
+            
+            # LangGraph-specific metrics
+            if iterations_list:
+                st.markdown("### 🔷 LangGraph Metrics")
+                avg_iterations = sum(iterations_list) / len(iterations_list)
+                st.metric("🔄 Avg Iterations", f"{avg_iterations:.1f}")
+                
+                # Iterations chart
+                fig_iterations = px.bar(
+                    x=list(range(1, len(iterations_list) + 1)),
+                    y=iterations_list,
+                    title="LangGraph Iterations per Query",
+                    labels={"x": "Query Number", "y": "Iterations"}
+                )
+                st.plotly_chart(fig_iterations, use_container_width=True)
+            
+            if tools_used_list:
+                avg_tools = sum(tools_used_list) / len(tools_used_list)
+                st.metric("🔧 Avg Tools Used", f"{avg_tools:.1f}")
+            
+            # Agent mode distribution
+            if agent_modes:
+                mode_counts = pd.Series(agent_modes).value_counts()
+                if len(mode_counts) > 0:
+                    st.markdown("### 📊 Agent Mode Usage")
+                    fig_mode = px.pie(
+                        values=mode_counts.values,
+                        names=mode_counts.index,
+                        title="Agent Mode Distribution"
+                    )
+                    st.plotly_chart(fig_mode, use_container_width=True)
         
         # Document analysis
         if documents:
@@ -366,22 +515,28 @@ def main():
                 st.plotly_chart(fig_chunks, use_container_width=True)
         
         # System tools
-        st.markdown("### Available Tools")
+        st.markdown("### 🔧 Available Agent Tools")
         tools = get_api_data("/tools")
         if tools:
+            st.info("These tools are orchestrated by LangGraph in `original` mode")
             for tool in tools["tools"]:
                 with st.expander(f"🔧 {tool['name']}"):
                     st.write(f"**Description:** {tool['description']}")
                     if "parameters" in tool:
                         st.write("**Parameters:**")
                         st.json(tool["parameters"])
+        else:
+            st.info("No tools available. Agent may be running in fast/ultra_fast mode.")
     
     # Footer
     st.markdown("---")
     st.markdown(
         """
         <div style='text-align: center; color: #666;'>
-            <p>🤖 Agentic RAG Chatbot - Powered by FastAPI, LangChain, ChromaDB, and Ollama</p>
+            <p>🤖 Agentic RAG Chatbot - Powered by FastAPI, LangChain + LangGraph, ChromaDB, and Ollama</p>
+            <p style='font-size: 0.9em; margin-top: 0.5rem;'>
+                🔷 LangGraph Mode | ⚡ Fast Mode | 🚀 Ultra-Fast Mode
+            </p>
         </div>
         """,
         unsafe_allow_html=True
