@@ -31,6 +31,10 @@ class AgentState(TypedDict):
     is_complete: bool
     session_id: str
     response: Optional[str]
+    tools_executed: List[str]  # Track which tools have been executed
+    needs_retrieval: bool
+    needs_summarization: bool
+    needs_comparison: bool
 
 
 class LLMAgent:
@@ -88,34 +92,46 @@ class LLMAgent:
             raise
     
     def _build_graph(self):
-        """Build the LangGraph workflow."""
+        """Build the LangGraph workflow with proper routing and termination."""
         try:
             # Create the graph
             workflow = StateGraph(AgentState)
             
             # Add nodes
             workflow.add_node("agent", self._agent_node)
-            workflow.add_node("tools", self._tool_node)
             workflow.add_node("retriever", self._retriever_node)
             workflow.add_node("summarizer", self._summarizer_node)
             workflow.add_node("comparator", self._comparator_node)
-            workflow.add_node("voice", self._voice_node)
+            workflow.add_node("finalize", self._finalize_node)
             
-            # Add edges
-            workflow.add_edge("agent", "tools")
-            workflow.add_edge("tools", "agent")
+            # Add conditional routing from agent
+            workflow.add_conditional_edges(
+                "agent",
+                self._should_continue,
+                {
+                    "retriever": "retriever",
+                    "summarizer": "summarizer",
+                    "comparator": "comparator",
+                    "finalize": "finalize",
+                    "end": END
+                }
+            )
+            
+            # All tool nodes return to agent for next decision
             workflow.add_edge("retriever", "agent")
             workflow.add_edge("summarizer", "agent")
             workflow.add_edge("comparator", "agent")
-            workflow.add_edge("voice", "agent")
+            
+            # Finalize node goes to END
+            workflow.add_edge("finalize", END)
             
             # Set entry point
             workflow.set_entry_point("agent")
             
-            # Compile the graph
+            # Compile the graph with increased recursion limit
             self.graph = workflow.compile()
             
-            logger.info("LangGraph workflow built successfully")
+            logger.info("LangGraph workflow built successfully with conditional routing")
             
         except Exception as e:
             logger.error(f"Error building graph: {e}")
@@ -124,56 +140,51 @@ class LLMAgent:
     def _agent_node(self, state: AgentState) -> AgentState:
         """Main agent reasoning node."""
         try:
-            # Check if we should continue
+            # Check if we should stop
             if state["iteration_count"] >= state["max_iterations"]:
+                logger.warning(f"Max iterations ({state['max_iterations']}) reached, finalizing")
                 state["is_complete"] = True
+                return state
+            
+            # Check if already complete
+            if state["is_complete"]:
                 return state
             
             # Get the latest message
             messages = state["messages"]
             if not messages:
+                state["is_complete"] = True
                 return state
             
             latest_message = messages[-1]
             
-            # Determine next action based on message content
-            if isinstance(latest_message, HumanMessage):
+            # Initialize tools_executed if not present
+            if "tools_executed" not in state:
+                state["tools_executed"] = []
+            
+            # On first iteration, analyze the query
+            if state["iteration_count"] == 0 and isinstance(latest_message, HumanMessage):
                 query = latest_message.content
                 state["current_query"] = query
                 
                 # Analyze query to determine tools needed
                 tool_decision = self._analyze_query(query)
+                state["needs_retrieval"] = tool_decision["needs_retrieval"]
+                state["needs_summarization"] = tool_decision["needs_summarization"]
+                state["needs_comparison"] = tool_decision["needs_comparison"]
                 
-                if tool_decision["needs_retrieval"]:
-                    # Go to retriever
-                    return state
-                elif tool_decision["needs_summarization"]:
-                    # Go to summarizer
-                    return state
-                elif tool_decision["needs_comparison"]:
-                    # Go to comparator
-                    return state
-                elif tool_decision["needs_voice"]:
-                    # Go to voice
-                    return state
-                else:
-                    # Generate direct response
-                    response = self._generate_response(query, state)
-                    state["response"] = response
-                    state["is_complete"] = True
+                logger.info(f"Query analysis: retrieval={tool_decision['needs_retrieval']}, "
+                          f"summarization={tool_decision['needs_summarization']}, "
+                          f"comparison={tool_decision['needs_comparison']}")
             
-            elif isinstance(latest_message, AIMessage):
-                # Agent has completed a tool call, continue reasoning
-                state["iteration_count"] += 1
-                
-                # Check if we have enough information to respond
-                if self._has_sufficient_information(state):
-                    response = self._generate_final_response(state)
-                    state["response"] = response
-                    state["is_complete"] = True
-                else:
-                    # Continue with more tool calls
-                    pass
+            # Increment iteration count
+            state["iteration_count"] += 1
+            logger.debug(f"Agent node iteration {state['iteration_count']}")
+            
+            # Check if we have enough information to respond
+            if self._has_sufficient_information(state) and state["iteration_count"] > 1:
+                logger.info("Sufficient information gathered, ready to finalize")
+                state["is_complete"] = True
             
             return state
             
@@ -182,6 +193,55 @@ class LLMAgent:
             state["is_complete"] = True
             state["response"] = f"Error processing query: {str(e)}"
             return state
+    
+    def _should_continue(self, state: AgentState) -> str:
+        """Determine next step in the workflow."""
+        try:
+            # If complete, go to finalize
+            if state.get("is_complete", False):
+                return "finalize"
+            
+            # Check max iterations
+            if state["iteration_count"] >= state["max_iterations"]:
+                logger.warning("Max iterations reached, finalizing")
+                return "finalize"
+            
+            # Determine which tool to execute
+            tools_executed = state.get("tools_executed", [])
+            
+            # Priority: retrieval first (if needed and not executed)
+            if state.get("needs_retrieval", False) and "retriever" not in tools_executed:
+                return "retriever"
+            
+            # Then summarization (if needed and not executed)
+            if state.get("needs_summarization", False) and "summarizer" not in tools_executed:
+                # Only if we have content to summarize
+                if state.get("retrieved_chunks") or len(state.get("messages", [])) > 1:
+                    return "summarizer"
+            
+            # Then comparison (if needed and not executed)
+            if state.get("needs_comparison", False) and "comparator" not in tools_executed:
+                # Only if we have enough chunks for comparison
+                if len(state.get("retrieved_chunks", [])) >= 2:
+                    return "comparator"
+            
+            # If we have information, finalize
+            if self._has_sufficient_information(state):
+                return "finalize"
+            
+            # If no tools needed and we have a query, generate direct response
+            if not state.get("needs_retrieval", False) and \
+               not state.get("needs_summarization", False) and \
+               not state.get("needs_comparison", False):
+                return "finalize"
+            
+            # Default: finalize to prevent infinite loops
+            logger.warning("No clear next step, finalizing to prevent infinite loop")
+            return "finalize"
+            
+        except Exception as e:
+            logger.error(f"Error in routing decision: {e}")
+            return "finalize"
     
     def _analyze_query(self, query: str) -> Dict[str, bool]:
         """Analyze query to determine which tools are needed."""
@@ -214,6 +274,12 @@ class LLMAgent:
     def _retriever_node(self, state: AgentState) -> AgentState:
         """Retriever tool node."""
         try:
+            # Mark retriever as executed
+            if "tools_executed" not in state:
+                state["tools_executed"] = []
+            if "retriever" not in state["tools_executed"]:
+                state["tools_executed"].append("retriever")
+            
             query = state["current_query"]
             
             # Execute retriever tool
@@ -238,11 +304,22 @@ class LLMAgent:
             logger.error(f"Error in retriever node: {e}")
             error_message = AIMessage(content=f"Retriever error: {str(e)}")
             state["messages"].append(error_message)
+            # Mark as executed even on error to prevent retry loops
+            if "tools_executed" not in state:
+                state["tools_executed"] = []
+            if "retriever" not in state["tools_executed"]:
+                state["tools_executed"].append("retriever")
             return state
     
     def _summarizer_node(self, state: AgentState) -> AgentState:
         """Summarizer tool node."""
         try:
+            # Mark summarizer as executed
+            if "tools_executed" not in state:
+                state["tools_executed"] = []
+            if "summarizer" not in state["tools_executed"]:
+                state["tools_executed"].append("summarizer")
+            
             # Get content to summarize
             content = ""
             if state["retrieved_chunks"]:
@@ -269,11 +346,22 @@ class LLMAgent:
             logger.error(f"Error in summarizer node: {e}")
             error_message = AIMessage(content=f"Summarizer error: {str(e)}")
             state["messages"].append(error_message)
+            # Mark as executed even on error
+            if "tools_executed" not in state:
+                state["tools_executed"] = []
+            if "summarizer" not in state["tools_executed"]:
+                state["tools_executed"].append("summarizer")
             return state
     
     def _comparator_node(self, state: AgentState) -> AgentState:
         """Comparator tool node."""
         try:
+            # Mark comparator as executed
+            if "tools_executed" not in state:
+                state["tools_executed"] = []
+            if "comparator" not in state["tools_executed"]:
+                state["tools_executed"].append("comparator")
+            
             # For now, use retrieved chunks for comparison
             # This can be enhanced to handle more complex comparison scenarios
             chunks = state["retrieved_chunks"]
@@ -306,6 +394,11 @@ class LLMAgent:
             logger.error(f"Error in comparator node: {e}")
             error_message = AIMessage(content=f"Comparator error: {str(e)}")
             state["messages"].append(error_message)
+            # Mark as executed even on error
+            if "tools_executed" not in state:
+                state["tools_executed"] = []
+            if "comparator" not in state["tools_executed"]:
+                state["tools_executed"].append("comparator")
             return state
     
     def _voice_node(self, state: AgentState) -> AgentState:
@@ -336,10 +429,26 @@ class LLMAgent:
             state["messages"].append(error_message)
             return state
     
-    def _tool_node(self, state: AgentState) -> AgentState:
-        """Generic tool execution node."""
-        # This can be used for additional tool processing
-        return state
+    def _finalize_node(self, state: AgentState) -> AgentState:
+        """Finalize node - generates the final response and marks as complete."""
+        try:
+            if state.get("response") is None:
+                # Generate response if not already generated
+                if state.get("retrieved_chunks"):
+                    response = self._generate_final_response(state)
+                else:
+                    response = self._generate_response(state["current_query"], state)
+                state["response"] = response
+            
+            state["is_complete"] = True
+            logger.info("Finalized response generation")
+            return state
+            
+        except Exception as e:
+            logger.error(f"Error in finalize node: {e}")
+            state["response"] = f"Error generating response: {str(e)}"
+            state["is_complete"] = True
+            return state
     
     def _has_sufficient_information(self, state: AgentState) -> bool:
         """Check if we have sufficient information to generate a response."""
@@ -410,14 +519,19 @@ Provide a comprehensive answer based on the context. If the context doesn't cont
                 retrieved_chunks=[],
                 tool_calls=[],
                 iteration_count=0,
-                max_iterations=settings.max_iterations,
+                max_iterations=min(settings.max_iterations, 10),  # Cap at 10 to prevent recursion issues
                 is_complete=False,
                 session_id=request.session_id or generate_id(),
-                response=None
+                response=None,
+                tools_executed=[],
+                needs_retrieval=False,
+                needs_summarization=False,
+                needs_comparison=False
             )
             
-            # Run the graph
-            final_state = self.graph.invoke(initial_state)
+            # Run the graph with increased recursion limit
+            config = {"recursion_limit": 50}  # Increased from default 25
+            final_state = self.graph.invoke(initial_state, config=config)
             
             # Calculate processing time
             processing_time = (datetime.now() - start_time).total_seconds()

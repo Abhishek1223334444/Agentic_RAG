@@ -6,9 +6,10 @@ A production-ready Retrieval-Augmented Generation (RAG) chatbot that can underst
 
 - **Document Processing**: Upload PDFs, extract and chunk text, generate embeddings
 - **Vector Storage**: ChromaDB for efficient similarity search
-- **Agentic Reasoning**: Multi-step reasoning with LangGraph
+- **Agentic Reasoning**: Multi-step reasoning with LangGraph (fully functional)
+- **Multiple Agent Modes**: Choose between LangGraph, optimized fast mode, or ultra-fast mode
 - **Offline LLM**: Ollama with Mistral 7B for local inference
-- **Advanced Retrieval**: BGE reranker for improved relevance
+- **Advanced Retrieval**: BGE reranker for improved relevance (optional)
 - **Voice Integration**: Whisper for speech-to-text, gTTS for text-to-speech
 - **Conversational Memory**: Maintains context across conversations
 - **Modern UI**: Streamlit interface with chat, upload, and visualization
@@ -89,7 +90,8 @@ streamlit run ui/app.py
 
 ```
 ├── main.py                 # FastAPI application entry point
-├── llm_agent.py           # LangGraph agent implementation
+├── llm_agent.py           # LangGraph agent implementation (original mode)
+├── llm_agent_fast.py      # Optimized fast and ultra-fast agent implementations
 ├── embed_store.py         # ChromaDB embedding store
 ├── memory.py              # Conversational memory system
 ├── config.py              # Configuration management
@@ -120,11 +122,19 @@ streamlit run ui/app.py
 3. Process the query and generate a response
 4. Listen to the audio response using gTTS
 
-### Multi-step Reasoning
-The agent can handle complex queries that require multiple steps:
+### Multi-step Reasoning (LangGraph Mode)
+When using `AGENT_MODE=original`, the agent can handle complex queries that require multiple steps:
 - "Compare the main points in chapters 1 and 3"
 - "Summarize the key findings and then explain their implications"
 - "Find information about X, then search for related concepts Y"
+
+The LangGraph agent automatically:
+- Analyzes the query to determine which tools are needed
+- Executes tools in the correct sequence
+- Combines results from multiple tools
+- Generates comprehensive responses
+
+**Note**: Multi-step reasoning is available only in `original` mode. For faster responses with simpler queries, use `fast` or `ultra_fast` modes.
 
 ## ⚙️ Configuration
 
@@ -165,11 +175,36 @@ CHUNK_OVERLAP=200
 # Agent Configuration
 MAX_ITERATIONS=10
 TEMPERATURE=0.7
+AGENT_MODE=original
+# Options: "original" (LangGraph with multi-step reasoning), "fast" (optimized), "ultra_fast" (maximum speed)
+
+# Performance Configuration (optional)
+ENABLE_RERANKING=false
+MAX_CONTEXT_CHUNKS=3
+RESPONSE_MAX_LENGTH=512
+```
+
+### Agent Modes
+
+The system supports three agent modes, configured via `AGENT_MODE` in `.env`:
+
+| Mode | Description | Best For |
+|------|-------------|----------|
+| **`original`** | Full LangGraph implementation with multi-step reasoning, tool orchestration, and conditional routing | Complex queries requiring multi-step reasoning, tool coordination |
+| **`fast`** | Optimized agent without LangGraph overhead, direct retrieval and response | General queries with good balance of speed and accuracy |
+| **`ultra_fast`** | Maximum speed mode with minimal context and short responses | Simple queries requiring fastest response times |
+
+**Changing Agent Mode:**
+```bash
+# Edit .env file
+AGENT_MODE=original    # For LangGraph
+AGENT_MODE=fast        # For optimized speed (default)
+AGENT_MODE=ultra_fast  # For maximum speed
 ```
 
 ### Model Configuration
 - **Embedding Model**: Uses `sentence-transformers/all-MiniLM-L6-v2` by default
-- **Reranker**: Uses `BAAI/bge-reranker-base` for improved relevance
+- **Reranker**: Uses `BAAI/bge-reranker-base` for improved relevance (can be disabled for speed)
 - **LLM**: Mistral 7B via Ollama (fully offline)
 
 ## 🔧 API Endpoints
@@ -197,12 +232,27 @@ TEMPERATURE=0.7
 
 ## 🧠 Agent Tools
 
-The system includes several specialized tools:
+The system includes several specialized tools that work seamlessly in LangGraph mode:
 
-1. **Retriever Tool**: Searches for relevant document chunks
-2. **Summarizer Tool**: Creates summaries of content
+1. **Retriever Tool**: Searches for relevant document chunks using vector similarity
+2. **Summarizer Tool**: Creates summaries of content using the LLM
 3. **Comparator Tool**: Compares different pieces of content
 4. **Voice Tool**: Handles speech-to-text and text-to-speech
+
+### LangGraph Agent Architecture
+
+When using `AGENT_MODE=original`, the system leverages LangGraph for sophisticated workflow orchestration:
+
+- **Conditional Routing**: Agent intelligently routes to appropriate tools based on query analysis
+- **Multi-step Reasoning**: Handles complex queries requiring multiple tool invocations
+- **Tool Execution Tracking**: Prevents infinite loops and re-execution of tools
+- **Proper Termination**: Ensures graphs complete within iteration limits
+- **Error Handling**: Graceful error recovery throughout the workflow
+
+The LangGraph workflow follows this pattern:
+```
+Query → Agent Node (Analyze) → Conditional Routing → Tools → Agent Node → Finalize → Response
+```
 
 ## 🔍 Troubleshooting
 
@@ -231,17 +281,32 @@ The system includes several specialized tools:
    - Reduce `MAX_CHUNKS` in configuration
    - Use a smaller embedding model
    - Increase system RAM
+   - Switch to `fast` or `ultra_fast` agent mode
+
+5. **LangGraph recursion errors**
+   - ✅ **Fixed!** The recursion limit issue has been resolved
+   - If you encounter recursion errors, check that you're using the latest version
+   - The system automatically sets recursion_limit to 50 and caps max_iterations at 10
+   - Ensure `AGENT_MODE=original` is set correctly in `.env`
 
 ### Performance Optimization
 
-1. **For better performance**:
+1. **For better performance with LangGraph** (`AGENT_MODE=original`):
    - Use GPU acceleration for embeddings (if available)
    - Increase `CHUNK_SIZE` for longer documents
-   - Adjust `MAX_ITERATIONS` based on query complexity
+   - Adjust `MAX_ITERATIONS` based on query complexity (default: 10)
+   - Disable reranking: `ENABLE_RERANKING=false` for faster responses
 
-2. **For lower resource usage**:
-   - Use smaller models
-   - Reduce `MAX_CHUNKS`
+2. **For maximum speed**:
+   - Use `AGENT_MODE=fast` or `AGENT_MODE=ultra_fast`
+   - Set `ENABLE_RERANKING=false` (saves 2-3 seconds per query)
+   - Reduce `MAX_CONTEXT_CHUNKS=3` (default)
+   - Lower `RESPONSE_MAX_LENGTH=512` (default)
+
+3. **For lower resource usage**:
+   - Use smaller models (e.g., `llama3.2:3b` instead of `mistral:7b`)
+   - Reduce `MAX_CHUNKS` to 3-5
+   - Switch to `ultra_fast` mode
    - Enable memory cleanup
 
 ## 🧪 Testing

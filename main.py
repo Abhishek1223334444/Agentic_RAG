@@ -21,7 +21,6 @@ from models import (
 from embed_store import EmbeddingStore
 from llm_agent import LLMAgent
 from llm_agent_fast import FastLLMAgent, UltraFastLLMAgent
-from llm_agent_context_focused import ContextFocusedAgent
 from utils import DocumentProcessor, AudioUtils, generate_id, validate_file_type
 from config import settings, get_settings
 
@@ -74,18 +73,20 @@ async def startup_event():
         agent_mode = settings.agent_mode.lower()
         logger.info(f"Initializing LLM agent in '{agent_mode}' mode")
         
-        if agent_mode == "context_focused":
-            llm_agent = ContextFocusedAgent(embedding_store)
-            logger.info("Context-Focused LLM Agent initialized")
-        elif agent_mode == "ultra_fast":
+        if agent_mode == "ultra_fast":
             llm_agent = UltraFastLLMAgent(embedding_store)
             logger.info("Ultra-Fast LLM Agent initialized")
         elif agent_mode == "fast":
             llm_agent = FastLLMAgent(embedding_store)
             logger.info("Fast LLM Agent initialized")
-        else:
+        elif agent_mode == "original":
             llm_agent = LLMAgent(embedding_store)
-            logger.info("Original LLM Agent initialized")
+            logger.info("Original LLM Agent (LangGraph) initialized")
+        else:
+            # Default fallback to fast mode if invalid mode specified
+            logger.warning(f"Unknown agent mode '{agent_mode}', defaulting to 'fast'")
+            llm_agent = FastLLMAgent(embedding_store)
+            logger.info("Fast LLM Agent initialized (default fallback)")
         
         logger.info("API startup completed successfully")
         

@@ -33,6 +33,8 @@ CHUNK_OVERLAP=200
 # Agent Configuration
 MAX_ITERATIONS=10
 TEMPERATURE=0.7
+AGENT_MODE=original
+# Options: "original" (LangGraph), "fast" (optimized), "ultra_fast" (maximum speed)
 
 # Memory Configuration
 MEMORY_DB_PATH=memory.db

@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     temperature: float = Field(default=0.7, env="TEMPERATURE")
     
     # Performance Configuration
-    agent_mode: str = Field(default="context_focused", env="AGENT_MODE")  # Options: "original", "fast", "ultra_fast", "context_focused"
+    agent_mode: str = Field(default="fast", env="AGENT_MODE")  # Options: "original" (LangGraph), "fast" (optimized), "ultra_fast" (maximum speed)
     enable_reranking: bool = Field(default=False, env="ENABLE_RERANKING")  # Disable for speed
     max_context_chunks: int = Field(default=3, env="MAX_CONTEXT_CHUNKS")  # Limit context for speed
     response_max_length: int = Field(default=512, env="RESPONSE_MAX_LENGTH")  # Limit response length
