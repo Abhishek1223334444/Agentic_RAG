@@ -1,0 +1,40 @@
+# Environment configuration for Agentic RAG Chatbot
+
+# Ollama Configuration
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=mistral:7b
+
+# ChromaDB Configuration
+CHROMA_PERSIST_DIRECTORY=./chroma_db
+CHROMA_COLLECTION_NAME=documents
+
+# Embedding Model
+EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+
+# Reranker Model
+RERANKER_MODEL=BAAI/bge-reranker-base
+
+# Audio Configuration
+AUDIO_SAMPLE_RATE=16000
+AUDIO_CHUNK_SIZE=1024
+
+# API Configuration
+API_HOST=0.0.0.0
+API_PORT=8000
+
+# Streamlit Configuration
+STREAMLIT_PORT=8501
+
+# Retrieval Configuration
+MAX_CHUNKS=5
+CHUNK_SIZE=1000
+CHUNK_OVERLAP=200
+
+# Agent Configuration
+MAX_ITERATIONS=10
+TEMPERATURE=0.7
+
+# Memory Configuration
+MEMORY_DB_PATH=memory.db
+MAX_MEMORY_ITEMS=1000
+MEMORY_DECAY_DAYS=30
