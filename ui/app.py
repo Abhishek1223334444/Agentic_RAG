@@ -41,11 +41,11 @@ st.markdown("""
         border-left: 4px solid #1f77b4;
     }
     .user-message {
-        background-color: #e3f2fd;
+        background-color: #000000;
         border-left-color: #2196f3;
     }
     .assistant-message {
-        background-color: #f3e5f5;
+        background-color: #000000;
         border-left-color: #9c27b0;
     }
     .sidebar-section {
@@ -177,6 +177,12 @@ def display_chat_message(message: Dict[str, Any], is_user: bool = False):
                 if "sources_count" in metadata:
                     st.write(f"📚 **Sources**: {metadata['sources_count']}")
                 
+                # Show source documents if available
+                if "source_documents" in metadata and metadata["source_documents"]:
+                    st.write("📄 **Source Documents:**")
+                    for doc_name in metadata["source_documents"]:
+                        st.write(f"  • {doc_name}")
+                
                 # Show full metadata as JSON
                 if "full_metadata" in metadata:
                     st.write("**Full Metadata:**")
@@ -265,13 +271,30 @@ def main():
                     st.write(f"**Size:** {doc['content_length']} characters")
 
             # Document selection for scoped retrieval
-            doc_options = {f"{doc['filename']} ({doc['id']})": doc["id"] for doc in documents}
+            st.markdown("### 📌 Document Selection")
+            st.info(
+                "💡 **Tip**: Select specific documents to limit retrieval. "
+                "Leave empty to search across all documents."
+            )
+            
+            doc_options = {f"{doc['filename']}": doc["id"] for doc in documents}
             selected_labels = st.multiselect(
-                "Limit retrieval to specific documents (optional)",
+                "Select documents to search (optional)",
                 options=list(doc_options.keys()),
-                default=[label for label, doc_id in doc_options.items() if doc_id in st.session_state.selected_documents]
+                default=[label for label, doc_id in doc_options.items() if doc_id in st.session_state.selected_documents],
+                help="When documents are selected, the LLM will only retrieve information from these specific PDFs. Leave empty to search all documents."
             )
             st.session_state.selected_documents = [doc_options[label] for label in selected_labels]
+            
+            # Show selection status
+            if st.session_state.selected_documents:
+                st.success(f"✅ Searching in {len(st.session_state.selected_documents)} selected document(s)")
+                with st.expander("📋 Selected Documents"):
+                    for label, doc_id in doc_options.items():
+                        if doc_id in st.session_state.selected_documents:
+                            st.write(f"• {label}")
+            else:
+                st.info("🌐 Searching across all documents")
         
         st.markdown("---")
         
@@ -301,6 +324,15 @@ def main():
         with chat_container:
             for message in st.session_state.chat_history:
                 display_chat_message(message, is_user=(message["role"] == "user"))
+        
+        # Show document selection status in main area
+        if st.session_state.selected_documents and documents:
+            selected_names = [
+                doc['filename'] for doc in documents 
+                if doc['id'] in st.session_state.selected_documents
+            ]
+            if selected_names:
+                st.info(f"🔍 **Searching in**: {', '.join(selected_names[:3])}{'...' if len(selected_names) > 3 else ''}")
         
         # Chat input
         user_input = st.text_input(
@@ -366,6 +398,25 @@ def main():
                             # Extract metadata for display
                             metadata = response.get("metadata", {})
                             
+                            # Extract source document IDs from sources
+                            source_doc_ids = set()
+                            if response.get("sources"):
+                                for source in response["sources"]:
+                                    if isinstance(source, dict):
+                                        doc_id = source.get("document_id") or source.get("metadata", {}).get("document_id")
+                                    else:
+                                        doc_id = getattr(source, "document_id", None) or getattr(source, "metadata", {}).get("document_id", None)
+                                    if doc_id:
+                                        source_doc_ids.add(doc_id)
+                            
+                            # Get source document names
+                            source_doc_names = []
+                            if documents and source_doc_ids:
+                                source_doc_names = [
+                                    doc['filename'] for doc in documents 
+                                    if doc['id'] in source_doc_ids
+                                ]
+                            
                             # Add assistant response to history
                             assistant_message = {
                                 "id": f"assistant_{datetime.now().timestamp()}",
@@ -379,6 +430,7 @@ def main():
                                     "tools_used": metadata.get("tools_used", 0),
                                     "chunks_retrieved": metadata.get("chunks_retrieved", 0),
                                     "agent_mode": "LangGraph" if metadata.get("iterations") is not None else "Fast/Ultra-Fast",
+                                    "source_documents": source_doc_names,
                                     "full_metadata": metadata
                                 }
                             }
