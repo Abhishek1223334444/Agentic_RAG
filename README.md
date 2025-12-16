@@ -64,6 +64,21 @@ cp env_example.txt .env
 # Edit .env file with your preferred settings
 ```
 
+## 📸 Screenshots & Demo
+
+### Demo Video
+Watch a complete walkthrough of the Agentic RAG Chatbot in action:
+
+https://github.com/yourusername/Agentic_RAG/blob/main/media/agentic_rag_demo.mp4
+
+### Screenshots
+
+**Streamlit UI**
+![Streamlit UI](media/streamlit_ui.png)
+
+**FastAPI Swagger Documentation**
+![Swagger API Docs](media/swagger.png)
+
 ## 🚀 Quick Start
 
 ### 1. Start Ollama Server
