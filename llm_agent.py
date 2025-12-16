@@ -1,6 +1,7 @@
 # LangGraph-based agent with multi-step reasoning capabilities
 
 import logging
+import re
 from typing import List, Dict, Any, Optional, TypedDict, Annotated
 from datetime import datetime
 import json
@@ -11,7 +12,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
 
-from models import ChatMessage, AgentState, QueryRequest, QueryResponse
+from models import ChatMessage, AgentState, QueryRequest, QueryResponse, DocumentChunk
 from tools import ToolRegistry, RetrieverTool, SummarizerTool, ComparatorTool, VoiceTool
 from embed_store import EmbeddingStore
 from config import settings
@@ -25,6 +26,7 @@ class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     current_query: str
     retrieved_chunks: List[Dict[str, Any]]
+    document_ids: Optional[List[str]]
     tool_calls: List[Dict[str, Any]]
     iteration_count: int
     max_iterations: int
@@ -195,62 +197,82 @@ class LLMAgent:
             return state
     
     def _should_continue(self, state: AgentState) -> str:
-        """Determine next step in the workflow."""
+        """Decision node - determines next step in the workflow."""
         try:
+            logger.debug(f"Decision node: iteration={state.get('iteration_count', 0)}, is_complete={state.get('is_complete', False)}")
+            
             # If complete, go to finalize
             if state.get("is_complete", False):
+                logger.debug("State is complete, routing to finalize")
                 return "finalize"
             
             # Check max iterations
-            if state["iteration_count"] >= state["max_iterations"]:
-                logger.warning("Max iterations reached, finalizing")
+            if state.get("iteration_count", 0) >= state.get("max_iterations", 10):
+                logger.warning("Max iterations reached, routing to finalize")
                 return "finalize"
             
             # Determine which tool to execute
             tools_executed = state.get("tools_executed", [])
+            logger.debug(f"Tools executed so far: {tools_executed}")
             
-            # Priority: retrieval first (if needed and not executed)
-            if state.get("needs_retrieval", False) and "retriever" not in tools_executed:
+            # Priority 1: retrieval first (if needed and not executed)
+            needs_retrieval = state.get("needs_retrieval", False)
+            if needs_retrieval and "retriever" not in tools_executed:
+                logger.info("Decision: Routing to retriever node")
                 return "retriever"
             
-            # Then summarization (if needed and not executed)
-            if state.get("needs_summarization", False) and "summarizer" not in tools_executed:
+            # Priority 2: summarization (if needed and not executed)
+            needs_summarization = state.get("needs_summarization", False)
+            if needs_summarization and "summarizer" not in tools_executed:
                 # Only if we have content to summarize
-                if state.get("retrieved_chunks") or len(state.get("messages", [])) > 1:
+                retrieved_chunks = state.get("retrieved_chunks", [])
+                if retrieved_chunks or len(state.get("messages", [])) > 1:
+                    logger.info("Decision: Routing to summarizer node")
                     return "summarizer"
             
-            # Then comparison (if needed and not executed)
-            if state.get("needs_comparison", False) and "comparator" not in tools_executed:
+            # Priority 3: comparison (if needed and not executed)
+            needs_comparison = state.get("needs_comparison", False)
+            if needs_comparison and "comparator" not in tools_executed:
                 # Only if we have enough chunks for comparison
-                if len(state.get("retrieved_chunks", [])) >= 2:
+                retrieved_chunks = state.get("retrieved_chunks", [])
+                if len(retrieved_chunks) >= 2:
+                    logger.info("Decision: Routing to comparator node")
                     return "comparator"
             
-            # If we have information, finalize
+            # If we have retrieved chunks, we can finalize
             if self._has_sufficient_information(state):
+                logger.info("Decision: Sufficient information available, routing to finalize")
                 return "finalize"
             
             # If no tools needed and we have a query, generate direct response
-            if not state.get("needs_retrieval", False) and \
-               not state.get("needs_summarization", False) and \
-               not state.get("needs_comparison", False):
+            if not needs_retrieval and not needs_summarization and not needs_comparison:
+                logger.info("Decision: No tools needed, routing to finalize")
                 return "finalize"
             
             # Default: finalize to prevent infinite loops
-            logger.warning("No clear next step, finalizing to prevent infinite loop")
+            logger.warning("Decision: No clear next step, routing to finalize to prevent infinite loop")
             return "finalize"
             
         except Exception as e:
-            logger.error(f"Error in routing decision: {e}")
+            logger.error(f"Error in decision node (routing): {e}", exc_info=True)
             return "finalize"
     
     def _analyze_query(self, query: str) -> Dict[str, bool]:
         """Analyze query to determine which tools are needed."""
         query_lower = query.lower()
         
-        # Simple keyword-based analysis (can be enhanced with more sophisticated NLP)
-        needs_retrieval = any(keyword in query_lower for keyword in [
-            "find", "search", "what", "where", "when", "how", "explain", "tell me about"
-        ])
+        # Default to retrieval for most queries (RAG-first approach)
+        # Only skip retrieval for very specific non-document queries
+        skip_retrieval_keywords = ["hello", "hi", "thanks", "thank you", "bye", "goodbye"]
+        needs_retrieval = not any(keyword in query_lower for keyword in skip_retrieval_keywords)
+        
+        # Check for specific retrieval keywords (enhances confidence)
+        strong_retrieval_keywords = [
+            "find", "search", "what", "where", "when", "how", "explain", 
+            "tell me about", "describe", "define", "what is", "what are"
+        ]
+        if any(keyword in query_lower for keyword in strong_retrieval_keywords):
+            needs_retrieval = True
         
         needs_summarization = any(keyword in query_lower for keyword in [
             "summarize", "summary", "brief", "overview", "main points"
@@ -264,6 +286,8 @@ class LLMAgent:
             "speak", "voice", "audio", "listen", "hear"
         ])
         
+        logger.info(f"Query analysis: retrieval={needs_retrieval}, summarization={needs_summarization}, comparison={needs_comparison}")
+        
         return {
             "needs_retrieval": needs_retrieval,
             "needs_summarization": needs_summarization,
@@ -272,43 +296,77 @@ class LLMAgent:
         }
     
     def _retriever_node(self, state: AgentState) -> AgentState:
-        """Retriever tool node."""
+        """Retriever tool node - retrieves relevant document chunks."""
         try:
-            # Mark retriever as executed
+            logger.info("Retriever node executing...")
+            
+            # Ensure tools_executed list exists
             if "tools_executed" not in state:
                 state["tools_executed"] = []
+            
+            # Mark retriever as executed to prevent loops
             if "retriever" not in state["tools_executed"]:
                 state["tools_executed"].append("retriever")
+                logger.info("Marked retriever as executed")
             
-            query = state["current_query"]
+            # Ensure retrieved_chunks list exists
+            if "retrieved_chunks" not in state:
+                state["retrieved_chunks"] = []
+            if "document_ids" not in state:
+                state["document_ids"] = []
+            
+            query = state.get("current_query", "")
+            if not query:
+                logger.warning("No query found in state for retriever node")
+                error_message = AIMessage(content="Retrieval failed: No query available")
+                state["messages"].append(error_message)
+                return state
+            
+            logger.info(f"Executing retriever tool for query: {query[:50]}...")
             
             # Execute retriever tool
-            result = self.tool_registry.execute_tool("retriever_tool", query=query)
+            result = self.tool_registry.execute_tool(
+                "retriever_tool",
+                query=query,
+                max_chunks=settings.max_context_chunks,
+                threshold=0.3,  # Lower threshold to avoid missing relevant chunks
+                document_ids=state.get("document_ids") or None,
+            )
             
-            if result["success"]:
-                chunks = result["chunks"]
-                state["retrieved_chunks"] = [chunk.dict() for chunk in chunks]
+            if result.get("success", False):
+                chunks = result.get("chunks", [])
+                
+                # Convert chunks to dict format for state
+                state["retrieved_chunks"] = [chunk.dict() if hasattr(chunk, 'dict') else chunk for chunk in chunks]
                 
                 # Add tool call to messages
                 tool_message = AIMessage(content=f"Retrieved {len(chunks)} relevant chunks for query: {query}")
                 state["messages"].append(tool_message)
                 
-                logger.info(f"Retrieved {len(chunks)} chunks")
+                logger.info(f"Retriever node completed: Retrieved {len(chunks)} chunks")
             else:
-                error_message = AIMessage(content=f"Retrieval failed: {result.get('error', 'Unknown error')}")
+                # Even on failure, ensure retrieved_chunks is set (empty list)
+                state["retrieved_chunks"] = []
+                error_msg = result.get('error', 'Unknown error')
+                error_message = AIMessage(content=f"Retrieval failed: {error_msg}")
                 state["messages"].append(error_message)
+                logger.warning(f"Retriever node failed: {error_msg}")
             
             return state
             
         except Exception as e:
-            logger.error(f"Error in retriever node: {e}")
+            logger.error(f"Error in retriever node: {e}", exc_info=True)
             error_message = AIMessage(content=f"Retriever error: {str(e)}")
             state["messages"].append(error_message)
-            # Mark as executed even on error to prevent retry loops
+            
+            # Ensure state is properly initialized even on error
             if "tools_executed" not in state:
                 state["tools_executed"] = []
             if "retriever" not in state["tools_executed"]:
                 state["tools_executed"].append("retriever")
+            if "retrieved_chunks" not in state:
+                state["retrieved_chunks"] = []
+            
             return state
     
     def _summarizer_node(self, state: AgentState) -> AgentState:
@@ -432,79 +490,139 @@ class LLMAgent:
     def _finalize_node(self, state: AgentState) -> AgentState:
         """Finalize node - generates the final response and marks as complete."""
         try:
-            if state.get("response") is None:
-                # Generate response if not already generated
-                if state.get("retrieved_chunks"):
-                    response = self._generate_final_response(state)
-                else:
-                    response = self._generate_response(state["current_query"], state)
-                state["response"] = response
+            logger.info("Finalize node executing...")
             
+            # Check if response already exists
+            if state.get("response") is not None:
+                logger.info("Response already exists, skipping generation")
+                state["is_complete"] = True
+                return state
+            
+            # Get retrieved chunks
+            retrieved_chunks = state.get("retrieved_chunks", [])
+            query = state.get("current_query", "")
+            
+            logger.info(f"Finalize node: {len(retrieved_chunks)} chunks available, query: {query[:50]}...")
+            
+            # Generate response based on whether we have chunks
+            if retrieved_chunks and len(retrieved_chunks) > 0:
+                logger.info("Generating response from retrieved chunks")
+                response = self._generate_final_response(state)
+            else:
+                logger.info("No chunks available, generating LLM response with disclaimer")
+                response = self._generate_response(query, state)
+            
+            state["response"] = response
             state["is_complete"] = True
-            logger.info("Finalized response generation")
+            
+            logger.info(f"Finalize node completed: Response length={len(response)}")
             return state
             
         except Exception as e:
-            logger.error(f"Error in finalize node: {e}")
+            logger.error(f"Error in finalize node: {e}", exc_info=True)
             state["response"] = f"Error generating response: {str(e)}"
             state["is_complete"] = True
             return state
     
     def _has_sufficient_information(self, state: AgentState) -> bool:
         """Check if we have sufficient information to generate a response."""
-        # Simple heuristic: if we have retrieved chunks or completed tool calls
-        return len(state["retrieved_chunks"]) > 0 or len(state["tool_calls"]) > 0
+        # Simple heuristic: if we have any retrieved chunks, we can answer from documents
+        return len(state["retrieved_chunks"]) > 0
     
     def _generate_response(self, query: str, state: AgentState) -> str:
-        """Generate a direct response without tools."""
+        """
+        Generate a response when no document context is available.
+        
+        When no chunks are found, we still allow the LLM to answer,
+        but with a clear disclaimer that the answer is not from the uploaded documents.
+        """
+        logger.warning("No retrieved chunks available; generating LLM answer with disclaimer")
         try:
+            # Generate answer using LLM
             prompt = f"""You are a helpful AI assistant. Answer the following question based on your knowledge:
 
 Question: {query}
 
 Provide a clear and helpful response."""
             
-            response = self.llm.invoke(prompt)
-            return response
+            llm_answer = self.llm.invoke(prompt)
+            
+            # Prefix with disclaimer
+            return f"The query is not there in the context but the answer is: {llm_answer}"
             
         except Exception as e:
-            logger.error(f"Error generating response: {e}")
-            return f"I apologize, but I encountered an error while processing your query: {str(e)}"
+            logger.error(f"Error generating LLM response: {e}")
+            return f"The query is not there in the context but the answer is: I encountered an error while processing your query: {str(e)}"
     
     def _generate_final_response(self, state: AgentState) -> str:
-        """Generate the final response using retrieved information."""
-        logger.info("Generating final response using retrieved information")
+        """
+        Generate the final response using retrieved information.
+        
+        Uses LLM with strict context enforcement to ensure answers
+        are based only on the uploaded documents.
+        """
+        logger.info("Generating final response using LLM with retrieved chunks")
         try:
-            query = state["current_query"]
             chunks = state["retrieved_chunks"]
+            query = state.get("current_query", "")
             
-            logger.info(f"Using {len(chunks)} retrieved chunks for final response")
+            if not chunks:
+                logger.warning("No retrieved chunks available in _generate_final_response")
+                return (
+                    "I couldn't find any information about this in the uploaded documents. "
+                    "Please check if the PDF or other files actually contain the answer."
+                )
+
+            # Deduplicate chunk contents (the same PDF might be uploaded multiple times)
+            seen_contents = set()
+            unique_contents: List[str] = []
+            for chunk in chunks:
+                text = (chunk.get("content") or "").strip()
+                if text and text not in seen_contents:
+                    seen_contents.add(text)
+                    unique_contents.append(text)
+
+            if not unique_contents:
+                logger.warning("All retrieved chunks had empty content")
+                return (
+                    "I couldn't find any information about this in the uploaded documents. "
+                    "Please check if the PDF or other files actually contain the answer."
+                )
+
+            # Prepare context from top chunks (limit to avoid token limits)
+            max_context_chunks = min(len(unique_contents), getattr(settings, "max_context_chunks", 3))
+            context_parts = []
+            for i, content in enumerate(unique_contents[:max_context_chunks]):
+                context_parts.append(f"Source {i+1}:\n{content}")
             
-            # Prepare context from retrieved chunks
-            context = ""
-            if chunks:
-                context = "\n\n".join([f"Source {i+1}: {chunk['content']}" 
-                                     for i, chunk in enumerate(chunks[:3])])  # Use top 3 chunks
-                logger.debug(f"Prepared context from {min(len(chunks), 3)} chunks")
+            context = "\n\n".join(context_parts)
             
-            # Generate response with context
-            prompt = f"""You are a helpful AI assistant. Answer the following question using the provided context:
+            # Generate response with strict RAG prompt
+            prompt = f"""You are a strict RAG assistant. You MUST answer using ONLY the exact information provided in the context below.
+You are NOT allowed to use outside knowledge or to guess.
+When possible, use the exact text from the context. If you need to paraphrase, stay very close to the original wording.
 
 Question: {query}
 
 Context:
 {context}
 
-Provide a comprehensive answer based on the context. If the context doesn't contain enough information, say so clearly."""
+Instructions:
+- Use ONLY the information that appears in the context above.
+- If the context contains an exact definition or sentence that answers the question, use that information.
+- You may paraphrase slightly for clarity, but stay very close to the original wording from the context.
+- If the context does not contain enough information to fully answer, say: "Based on the uploaded documents, [partial answer]. The documents do not contain complete information about this topic."
+
+Answer:"""
             
-            logger.debug(f"Generated final prompt: {prompt[:300]}...")
+            logger.debug(f"Generated prompt for final response: {len(prompt)} characters")
             response = self.llm.invoke(prompt)
             
-            logger.info(f"Generated final response of {len(response)} characters")
-            return response
-            
+            logger.info(f"Generated final response: {len(response)} characters")
+            return response.strip()
+
         except Exception as e:
-            logger.error(f"Error generating final response: {e}")
+            logger.error(f"Error generating final response: {e}", exc_info=True)
             return f"I apologize, but I encountered an error while generating the response: {str(e)}"
     
     def process_query(self, request: QueryRequest) -> QueryResponse:
@@ -517,6 +635,7 @@ Provide a comprehensive answer based on the context. If the context doesn't cont
                 messages=[HumanMessage(content=request.query)],
                 current_query=request.query,
                 retrieved_chunks=[],
+                document_ids=request.document_ids,
                 tool_calls=[],
                 iteration_count=0,
                 max_iterations=min(settings.max_iterations, 10),  # Cap at 10 to prevent recursion issues
@@ -536,10 +655,22 @@ Provide a comprehensive answer based on the context. If the context doesn't cont
             # Calculate processing time
             processing_time = (datetime.now() - start_time).total_seconds()
             
+            # Prepare source chunks (convert dicts back to models)
+            source_chunks = []
+            try:
+                raw_chunks = final_state.get("retrieved_chunks", []) or []
+                max_sources = getattr(settings, "max_context_chunks", 3)
+                for chunk_dict in raw_chunks[:max_sources]:
+                    # chunk_dict was created via chunk.dict(), so it should map cleanly
+                    source_chunks.append(DocumentChunk(**chunk_dict))
+            except Exception as e:
+                logger.error(f"Error converting retrieved_chunks to DocumentChunk models: {e}")
+                source_chunks = []
+
             # Create response
             response = QueryResponse(
                 answer=final_state["response"] or "I couldn't generate a response.",
-                sources=[],  # Convert chunks to DocumentChunk objects if needed
+                sources=source_chunks,
                 session_id=final_state["session_id"],
                 query_time=processing_time,
                 metadata={

@@ -45,23 +45,20 @@ class RetrieverTool(BaseTool):
         )
         self.embedding_store = embedding_store
     
-    def execute(self, query: str, max_chunks: int = 5, threshold: float = 0.7) -> Dict[str, Any]:
+    def execute(self, query: str, max_chunks: int = 5, threshold: float = 0.7, document_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         """Execute the retrieval tool."""
         logger.info(f"Executing retriever tool: query='{query[:50]}...', max_chunks={max_chunks}, threshold={threshold}")
         try:
             logger.debug(f"Searching for relevant chunks with query: {query}")
-            
-            # Search for relevant chunks
-            chunks = self.embedding_store.search(query, max_chunks)
-            logger.info(f"Found {len(chunks)} chunks from embedding store")
-            
-            # Filter by threshold if specified
-            if threshold > 0:
-                original_count = len(chunks)
-                chunks = [chunk for chunk in chunks 
-                         if chunk.metadata.get("similarity_score", 0) >= threshold]
-                filtered_count = len(chunks)
-                logger.info(f"Filtered chunks by threshold {threshold}: {original_count} -> {filtered_count}")
+
+            # Use similarity_search so threshold is applied inside the store
+            chunks = self.embedding_store.similarity_search(
+                query=query,
+                threshold=threshold,
+                max_results=max_chunks,
+                document_ids=document_ids
+            )
+            logger.info(f"Retriever returned {len(chunks)} chunks after applying threshold {threshold}")
             
             # Prepare response
             response = {
@@ -100,7 +97,12 @@ class RetrieverTool(BaseTool):
                 "threshold": {
                     "type": "number",
                     "description": "Similarity threshold for filtering results",
-                    "default": 0.7
+                    "default": 0.3
+                },
+                "document_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of document IDs to restrict retrieval"
                 }
             },
             "required": ["query"]

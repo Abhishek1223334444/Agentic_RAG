@@ -4,7 +4,7 @@ import os
 import logging
 from typing import Optional
 from pydantic_settings import BaseSettings
-from pydantic import  Field
+from pydantic import Field
 from dotenv import load_dotenv
 
 # Configure logging
@@ -14,6 +14,25 @@ logger = logging.getLogger(__name__)
 logger.info("Loading environment variables from .env file")
 load_dotenv()
 logger.info("Environment variables loaded successfully")
+
+# Ensure local Ollama traffic does NOT go through any HTTP proxy
+try:
+    # Many corporate / system setups define HTTP(S)_PROXY that intercepts localhost
+    # We explicitly mark localhost and 127.0.0.1 as proxy bypass targets.
+    no_proxy = os.environ.get("NO_PROXY", os.environ.get("no_proxy", ""))
+    entries = {
+        h.strip()
+        for h in (no_proxy.split(",") if no_proxy else [])
+        if h.strip()
+    }
+    entries.update({"localhost", "127.0.0.1"})
+    updated_no_proxy = ",".join(sorted(entries))
+    os.environ["NO_PROXY"] = updated_no_proxy
+    os.environ["no_proxy"] = updated_no_proxy
+    logger.info(f"Configured NO_PROXY for local services: {updated_no_proxy}")
+except Exception as e:
+    # Never crash just because of proxy configuration
+    logger.warning(f"Could not configure NO_PROXY for localhost: {e}")
 
 
 class Settings(BaseSettings):

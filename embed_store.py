@@ -94,30 +94,57 @@ class EmbeddingStore:
     
     def _create_chunks(self, document: Document) -> List[DocumentChunk]:
         """Create chunks from document content."""
+        logger.info(f"Creating chunks for document {document.id}: content length={len(document.content)}")
+        
+        # Validate content is not empty
+        if not document.content or not document.content.strip():
+            logger.warning(f"Document {document.id} has empty content, cannot create chunks")
+            return []
+        
         chunks = []
-        chunk_texts = chunk_text(
-            document.content,
-            chunk_size=settings.chunk_size,
-            overlap=settings.chunk_overlap
-        )
-        
-        for i, chunk_content in enumerate(chunk_texts):
-            chunk = DocumentChunk(
-                chunk_id=generate_id(),
-                document_id=document.id,
-                content=clean_text(chunk_content),
-                metadata={
-                    "document_id": document.id,
-                    "filename": document.filename,
-                    "chunk_index": i,
-                    "total_chunks": len(chunk_texts),
-                    "document_type": document.document_type.value,
-                    "upload_time": document.upload_time.isoformat()
-                }
+        try:
+            chunk_texts = chunk_text(
+                document.content,
+                chunk_size=settings.chunk_size,
+                overlap=settings.chunk_overlap
             )
-            chunks.append(chunk)
-        
-        return chunks
+            
+            logger.info(f"Text chunking produced {len(chunk_texts)} raw chunks")
+            
+            if not chunk_texts:
+                logger.warning(f"No chunks created from document {document.id}")
+                return []
+            
+            for i, chunk_content in enumerate(chunk_texts):
+                # Clean the chunk content
+                cleaned_content = clean_text(chunk_content)
+                
+                # Skip empty chunks after cleaning
+                if not cleaned_content or len(cleaned_content.strip()) < 10:
+                    logger.debug(f"Skipping empty or too-short chunk {i} (length: {len(cleaned_content)})")
+                    continue
+                
+                chunk = DocumentChunk(
+                    chunk_id=generate_id(),
+                    document_id=document.id,
+                    content=cleaned_content,
+                    metadata={
+                        "document_id": document.id,
+                        "filename": document.filename,
+                        "chunk_index": i,
+                        "total_chunks": len(chunk_texts),
+                        "document_type": document.document_type.value,
+                        "upload_time": document.upload_time.isoformat()
+                    }
+                )
+                chunks.append(chunk)
+            
+            logger.info(f"Created {len(chunks)} valid chunks for document {document.id}")
+            return chunks
+            
+        except Exception as e:
+            logger.error(f"Error creating chunks for document {document.id}: {e}", exc_info=True)
+            raise
     
     def _prepare_metadata(self, chunk: DocumentChunk) -> Dict[str, Any]:
         """Prepare metadata for ChromaDB storage."""
@@ -128,8 +155,8 @@ class EmbeddingStore:
                 metadata[key] = str(value)
         return metadata
     
-    def search(self, query: str, max_results: int = None) -> List[DocumentChunk]:
-        """Search for relevant chunks."""
+    def search(self, query: str, max_results: int = None, document_ids: Optional[List[str]] = None) -> List[DocumentChunk]:
+        """Search for relevant chunks, optionally scoped to specific document IDs."""
         try:
             if max_results is None:
                 max_results = settings.max_chunks
@@ -138,10 +165,15 @@ class EmbeddingStore:
             query_embedding = self.embedding_model.encode([query]).tolist()[0]
             
             # Search in ChromaDB
+            where_filter = None
+            if document_ids:
+                where_filter = {"document_id": {"$in": document_ids}}
+            
             results = self.collection.query(
                 query_embeddings=[query_embedding],
                 n_results=max_results * 2,  # Get more results for reranking
-                include=["documents", "metadatas", "distances"]
+                include=["documents", "metadatas", "distances"],
+                where=where_filter
             )
             
             # Process results
@@ -287,12 +319,24 @@ class EmbeddingStore:
             logger.error(f"Error resetting collection: {e}")
             return False
     
-    def similarity_search(self, query: str, threshold: float = 0.7, max_results: int = None) -> List[DocumentChunk]:
-        """Search with similarity threshold."""
+    def similarity_search(self, query: str, threshold: float = 0.3, max_results: int = None, document_ids: Optional[List[str]] = None) -> List[DocumentChunk]:
+        """
+        Search with a similarity threshold.
+        
+        NOTE: The default threshold is intentionally low (0.3) to avoid
+        returning zero chunks for short/narrow queries. Higher thresholds
+        can easily filter out all results, which breaks strict RAG behavior.
+        """
         logger.info(f"Similarity search: query='{query[:50]}...', threshold={threshold}, max_results={max_results}")
-        chunks = self.search(query)
-        filtered_chunks = [chunk for chunk in chunks 
-                if chunk.metadata.get("similarity_score", 0) >= threshold]
+        
+        # First get a ranked list of chunks
+        chunks = self.search(query, max_results=max_results or settings.max_chunks, document_ids=document_ids)
+        
+        # Then filter by similarity score
+        filtered_chunks = [
+            chunk for chunk in chunks
+            if chunk.metadata.get("similarity_score", 0) >= threshold
+        ]
         
         # Apply max_results limit if specified
         if max_results is not None:

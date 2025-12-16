@@ -164,20 +164,51 @@ class DocumentProcessor:
             logger.debug("Opening PDF file")
             with open(file_path, 'rb') as file:
                 pdf_reader = PyPDF2.PdfReader(file)
+                
+                # Check if PDF is encrypted
+                if pdf_reader.is_encrypted:
+                    logger.error(f"PDF {file_path} is password-protected")
+                    raise ValueError("PDF is password-protected. Please provide an unencrypted PDF.")
+                
                 text = ""
                 page_count = len(pdf_reader.pages)
                 logger.debug(f"PDF has {page_count} pages")
                 
-                for i, page in enumerate(pdf_reader.pages):
-                    page_text = page.extract_text()
-                    text += page_text + "\n"
-                    logger.debug(f"Extracted text from page {i+1}: {len(page_text)} characters")
+                if page_count == 0:
+                    logger.warning(f"PDF {file_path} has no pages")
+                    raise ValueError("PDF has no pages or is corrupted.")
                 
-                logger.info(f"PDF text extraction completed: {len(text)} total characters from {page_count} pages")
-                return text.strip()
-        except Exception as e:
-            logger.error(f"Error extracting text from PDF {file_path}: {e}")
+                for i, page in enumerate(pdf_reader.pages):
+                    try:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text + "\n"
+                            logger.debug(f"Extracted text from page {i+1}: {len(page_text)} characters")
+                        else:
+                            logger.warning(f"No text extracted from page {i+1} - may be image-based or empty")
+                    except Exception as page_error:
+                        logger.warning(f"Error extracting text from page {i+1}: {page_error}")
+                        continue
+                
+                extracted_text = text.strip()
+                
+                if not extracted_text or len(extracted_text) < 10:
+                    logger.error(f"PDF text extraction produced very little text ({len(extracted_text)} chars). PDF may be image-based (scanned).")
+                    raise ValueError(
+                        "Could not extract sufficient text from PDF. "
+                        "The PDF may be image-based (scanned) or contain only images. "
+                        "Please use a PDF with selectable text or use OCR to convert scanned PDFs."
+                    )
+                
+                logger.info(f"PDF text extraction completed: {len(extracted_text)} total characters from {page_count} pages")
+                return extracted_text
+                
+        except ValueError:
+            # Re-raise ValueError as-is (these are our custom error messages)
             raise
+        except Exception as e:
+            logger.error(f"Error extracting text from PDF {file_path}: {e}", exc_info=True)
+            raise ValueError(f"Failed to extract text from PDF: {str(e)}")
     
     @staticmethod
     def extract_text_from_txt(file_path: str) -> str:

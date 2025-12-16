@@ -20,7 +20,6 @@ from models import (
 )
 from embed_store import EmbeddingStore
 from llm_agent import LLMAgent
-from llm_agent_fast import FastLLMAgent, UltraFastLLMAgent
 from utils import DocumentProcessor, AudioUtils, generate_id, validate_file_type
 from config import settings, get_settings
 
@@ -69,24 +68,10 @@ async def startup_event():
         # Initialize embedding store
         embedding_store = EmbeddingStore()
         
-        # Initialize LLM agent based on configuration
-        agent_mode = settings.agent_mode.lower()
-        logger.info(f"Initializing LLM agent in '{agent_mode}' mode")
-        
-        if agent_mode == "ultra_fast":
-            llm_agent = UltraFastLLMAgent(embedding_store)
-            logger.info("Ultra-Fast LLM Agent initialized")
-        elif agent_mode == "fast":
-            llm_agent = FastLLMAgent(embedding_store)
-            logger.info("Fast LLM Agent initialized")
-        elif agent_mode == "original":
-            llm_agent = LLMAgent(embedding_store)
-            logger.info("Original LLM Agent (LangGraph) initialized")
-        else:
-            # Default fallback to fast mode if invalid mode specified
-            logger.warning(f"Unknown agent mode '{agent_mode}', defaulting to 'fast'")
-            llm_agent = FastLLMAgent(embedding_store)
-            logger.info("Fast LLM Agent initialized (default fallback)")
+        # Initialize LLM agent (LangGraph/original only)
+        logger.info("Initializing LLM agent (LangGraph/original mode)")
+        llm_agent = LLMAgent(embedding_store)
+        logger.info("LLM Agent (LangGraph) initialized")
         
         logger.info("API startup completed successfully")
         
@@ -189,6 +174,16 @@ async def upload_document(
             logger.info(f"Extracting text from {doc_type.value} file")
             text_content = DocumentProcessor.extract_text(temp_file_path, doc_type.value)
             
+            # Validate extracted text
+            if not text_content or not text_content.strip():
+                logger.error(f"Failed to extract text from {file.filename} - content is empty")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Could not extract text from {file.filename}. The file may be corrupted, password-protected, or contain only images."
+                )
+            
+            logger.info(f"Extracted {len(text_content)} characters from {file.filename}")
+            
             # Create document object
             document = Document(
                 id=generate_id(),
@@ -234,18 +229,29 @@ async def process_document_background(document: Document):
     try:
         start_time = datetime.now()
         
+        # Validate document has content before processing
+        if not document.content or not document.content.strip():
+            logger.error(f"Document {document.id} has no content to process")
+            if document.id in uploaded_documents:
+                uploaded_documents[document.id].status = "processing_failed"
+            return
+        
         # Add document to embedding store
-        logger.info(f"Adding document {document.id} to embedding store")
+        logger.info(f"Adding document {document.id} to embedding store (content length: {len(document.content)})")
         embedding_store.add_document(document)
         
         # Get chunks count
         chunks = embedding_store.get_document_chunks(document.id)
         
         processing_time = (datetime.now() - start_time).total_seconds()
-        logger.info(f"Document {document.id} processed successfully with {len(chunks)} chunks in {processing_time:.2f} seconds")
+        
+        if len(chunks) == 0:
+            logger.warning(f"Document {document.id} processed but NO chunks were created! Content length: {len(document.content)}")
+        else:
+            logger.info(f"Document {document.id} processed successfully with {len(chunks)} chunks in {processing_time:.2f} seconds")
         
     except Exception as e:
-        logger.error(f"Error processing document {document.id}: {e}")
+        logger.error(f"Error processing document {document.id}: {e}", exc_info=True)
         # Update document status to indicate processing failure
         if document.id in uploaded_documents:
             uploaded_documents[document.id].status = "processing_failed"

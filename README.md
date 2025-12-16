@@ -91,7 +91,6 @@ streamlit run ui/app.py
 ```
 ├── main.py                 # FastAPI application entry point
 ├── llm_agent.py           # LangGraph agent implementation (original mode)
-├── llm_agent_fast.py      # Optimized fast and ultra-fast agent implementations
 ├── embed_store.py         # ChromaDB embedding store
 ├── memory.py              # Conversational memory system
 ├── config.py              # Configuration management

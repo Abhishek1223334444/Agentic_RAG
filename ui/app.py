@@ -67,6 +67,8 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "uploaded_files" not in st.session_state:
     st.session_state.uploaded_files = []
+if "selected_documents" not in st.session_state:
+    st.session_state.selected_documents = []
 
 
 def check_api_health() -> bool:
@@ -261,6 +263,15 @@ def main():
                     st.write(f"**Chunks:** {doc['chunks_count']}")
                     st.write(f"**Uploaded:** {doc['upload_time']}")
                     st.write(f"**Size:** {doc['content_length']} characters")
+
+            # Document selection for scoped retrieval
+            doc_options = {f"{doc['filename']} ({doc['id']})": doc["id"] for doc in documents}
+            selected_labels = st.multiselect(
+                "Limit retrieval to specific documents (optional)",
+                options=list(doc_options.keys()),
+                default=[label for label, doc_id in doc_options.items() if doc_id in st.session_state.selected_documents]
+            )
+            st.session_state.selected_documents = [doc_options[label] for label in selected_labels]
         
         st.markdown("---")
         
@@ -325,7 +336,8 @@ def main():
                         query_data = {
                             "query": user_input,
                             "session_id": st.session_state.session_id,
-                            "max_chunks": 5
+                            "max_chunks": 5,
+                            "document_ids": st.session_state.selected_documents or None
                         }
                         
                         status_text.text("📡 Connecting to API...")
